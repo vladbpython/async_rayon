@@ -1,2 +1,2 @@
 # async_rayon
-async rayon implementetion tokio
+async rayon implementetion tokio in development
