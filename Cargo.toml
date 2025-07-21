@@ -1,6 +1,6 @@
 [package]
 name = "async_rayon"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Vladyslav Bieliaiev <vldabpython@gmail.com>"]
 
@@ -8,5 +8,5 @@ authors = ["Vladyslav Bieliaiev <vldabpython@gmail.com>"]
 num_cpus = "1.17.0"
 crossbeam = "0.8.4"
 futures = "0.3.31"
-tokio = {version = "1.46.1", features = ["full"]}
-tokio-util = {version = "0.7.15"}
+tokio = { version = "1.46.1", features = ["full"] }
+tokio-util = { version = "0.7.15" }
