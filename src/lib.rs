@@ -318,6 +318,18 @@ impl Scope {
             .collect()
     }
 
+    pub async fn join_handles<T>(&self, handles: Vec<JoinHandle<T>>) -> Vec<T>
+    where
+        T: Send + 'static,
+    {
+        let results = futures::future::join_all(
+            handles.into_iter().map(|h| h.await_result()),
+        )
+        .await;
+
+        results.into_iter().filter_map(Result::ok).collect()
+    }
+
     pub async fn par_map_async<T, U, F, Fut>(&self, items: &[T], f: F) -> Vec<U>
     where
         T: Sync,
