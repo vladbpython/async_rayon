@@ -1,12 +1,31 @@
 [package]
 name = "async_rayon"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-authors = ["Vladyslav Bieliaiev <vldabpython@gmail.com>"]
+authors = ["Vladyslav Bieliaiev <vladbpython@gmail.com>"]
 
 [dependencies]
 num_cpus = "1.17.0"
 crossbeam = "0.8.4"
 futures = "0.3.31"
+rand = {version = "0.9.2", features = [] }
 tokio = { version = "1.46.1", features = ["full"] }
 tokio-util = { version = "0.7.15" }
+
+[dev-dependencies]
+criterion = { version = "0.7.0", features = ["async_tokio", "html_reports"] }
+
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.bench]
+inherits = "release"
+
+[[bench]]
+name = "threadpool_benchmarks"
+harness = false
