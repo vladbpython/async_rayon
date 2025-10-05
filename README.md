@@ -73,7 +73,7 @@ let handles: Vec<_> = (0..100_000)
 
 ## Rayon
 
-| `Feature` | `tokio::spawn` | `async_rayon`|
+| `Feature` | `rayon` | `async_rayon`|
 | ---| ---| ---|
 | Speed (CPU) | 50ms for 5M tasks ✅ | 6s for 5M tasks ❌ |
 | Blocking | ✅ Sync - no async overhead| ✅ Non-blocking async |
