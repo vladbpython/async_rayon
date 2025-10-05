@@ -167,9 +167,9 @@ let io_pool = ThreadPoolInner::with_config(Config::io_bound());
 // Extract (I/O)
 let data = io_scope.stream_process(sources, 1000, extract).await;
 // Transform (CPU)
-let transformed = cpu_scope.batch_process(data, 100, 10, transform).await;
+let transformed = cpu_scope.batch_process(data, 10, transform).await;
 // Load (I/O)
-io_scope.batch_process(transformed, 500, 50, load).await;
+io_scope.batch_process(transformed, 50, load).await;
 
 ```
 
