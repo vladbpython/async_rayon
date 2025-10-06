@@ -919,7 +919,6 @@ impl Scope {
     
     }
 
-
     #[inline]
     pub fn metrics(&self) -> ScopeMetrics {
         ScopeMetrics {
@@ -927,5 +926,44 @@ impl Scope {
             completed: self.completed.load(Ordering::Acquire),
             failed: self.failed.load(Ordering::Acquire),
         }
+    }
+
+
+    /// Мониторинг метрик с callback
+    /// ВАЖНО: Вызовите token.cancel() для остановки мониторинга и освобождения памяти
+    pub fn start_monitoring<F>(&self, interval: Duration, callback: F) -> CancellationToken
+    where
+        F: Fn(ScopeMetrics) + Send + 'static,
+    {
+        let counter = self.counter.clone();
+        let completed = self.completed.clone();
+        let failed = self.failed.clone();
+        
+        let token = CancellationToken::new();
+        let token_clone = token.clone();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {
+                        let metrics = ScopeMetrics {
+                            pending: counter.load(Ordering::Relaxed),
+                            completed: completed.load(Ordering::Relaxed),
+                            failed: failed.load(Ordering::Relaxed),
+                        };
+                        callback(metrics);
+                    }
+                    _ = token_clone.cancelled() => {
+                        break;
+                    }
+                }
+            }
+        });
+        token
+    }
+
+    /// Остановить мониторинг и дропнуть все ссылки
+    pub fn stop_monitoring(token: CancellationToken) {
+        token.cancel();
     }
 }

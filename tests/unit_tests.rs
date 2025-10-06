@@ -227,10 +227,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_monitoring() {
+    async fn test_monitoring_cpu() {
         println!("\n=== TEST: Мониторинг в реальном времени ===");
         let pool = ThreadPoolInner::new(8, Some(100));
-
         let monitor_token = pool.start_monitoring(Duration::from_millis(100), |metrics| {
             if metrics.active_tasks > 0 {
                 println!("  [Monitor] Active: {}, Queue: {}, Utilization: {:.1}%",
@@ -239,6 +238,26 @@ mod tests {
         });
 
         let scope = Scope::new(pool.clone());
+        let items: Vec<_> = (0..500).collect();
+        
+        let _results = scope.batch_process_cpu(items, 20,  |x| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            x
+        }).await;
+
+        monitor_token.cancel();
+        println!("  ✓ Мониторинг завершен");
+    }
+
+    #[tokio::test]
+    async fn test_monitoring_scope() {
+        println!("\n=== TEST: Мониторинг в реальном времени ===");
+        let pool = ThreadPoolInner::new(8, Some(100));
+        let scope = Scope::new(pool.clone());
+        let monitor_token = scope.start_monitoring(Duration::from_millis(100), |metrics| {
+                println!("  [Monitor] completed: {}, pending: {}, failed: {:.1}%",
+                         metrics.completed, metrics.pending, metrics.failed);
+        });
         let items: Vec<_> = (0..500).collect();
         
         let _results = scope.batch_process(items, 20,  |x| Box::pin(async move {
