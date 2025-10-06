@@ -13,6 +13,5 @@ pub mod handle;
 pub mod model;
 pub mod pool;
 pub mod result;
-pub mod scope;
 
 pub use pool::{ThreadPoolInner,Config,Scope};

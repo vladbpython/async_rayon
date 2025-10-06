@@ -34,7 +34,7 @@ async rayon implementetion tokio in development
 
 | `Feature` | `tokio::spawn` | `async_rayon`|
 | ---| ---| ---|
-| Speed | 3.4ms for 10k tasks ✅ | 14ms for 10k tasks ⚠️ |
+| Speed | 3.4242ms for 10k tasks ✅ | 9.6959ms for 10k tasks ⚠️ |
 | Max_pending | ❌ No limit - can OOM | ✅ Protects against OOM |
 | Metrics | ❌ Basic only  | ✅ Detailed (queue, utilization, etc) |
 | Graceful shutdown | ⚠️ Manual tracking | ✅ Built-in with timeout |
@@ -75,7 +75,7 @@ let handles: Vec<_> = (0..100_000)
 
 | `Feature` | `rayon` | `async_rayon`|
 | ---| ---| ---|
-| Speed (CPU) | 50ms for 5M tasks ✅ | 6s for 5M tasks ❌ |
+| Speed (CPU) | 50ms for 5M tasks ✅ | 4s for 5M tasks ❌ |
 | Blocking | ✅ Sync - no async overhead| ✅ Non-blocking async |
 | I/O tasks | ❌ Blocks OS threads  | ✅ 10k+ concurrent I/O |
 | Work-stealing | ✅ OS thread level | ✅ Async task level |

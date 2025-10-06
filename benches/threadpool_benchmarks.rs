@@ -1,9 +1,7 @@
 use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
 use async_rayon::pool::{ThreadPoolInner, Config as PoolConfig, Scope};
 use tokio::time::Duration;
-use std::{
-    hint::black_box,
-};
+use std::hint::black_box;
 
 fn create_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
@@ -17,37 +15,112 @@ fn create_runtime() -> tokio::runtime::Runtime {
 fn bench_spawn_overhead(c: &mut Criterion) {
     let mut group = c.benchmark_group("spawn_overhead");
     
-    for size in [100, 1000, 10000].iter() {
-        group.throughput(Throughput::Elements(*size as u64));
+    for size in [100, 1000, 10000] {
+        group.throughput(Throughput::Elements(size as u64));
         
-        // spawn_with_handle - с cancellation
-        group.bench_with_input(BenchmarkId::new("with_handle", size), size, |b, &size| {
-            let rt = create_runtime();
-            b.to_async(&rt).iter(|| async move {
-                let pool = ThreadPoolInner::with_config(PoolConfig::io_bound());
-                let scope = Scope::new(pool.clone());
+        // with_handle
+        group.bench_with_input(
+            BenchmarkId::new("with_handle", size),
+            &size,
+            |b, &size| {
+                let rt = tokio::runtime::Runtime::new().unwrap();
                 
-                let handles: Vec<_> = (0..size)
-                    .map(|i| scope.spawn_with_handle(async move { i }))
-                    .collect();
+                let pool = rt.block_on(async {
+                    ThreadPoolInner::with_config(PoolConfig::default())
+                });
                 
-                let _results = scope.join_handles(handles).await;
-            });
-        });
+                // ✅ Создаем scope ОДИН РАЗ
+                let scope = Scope::new(pool);
+                
+                b.to_async(&rt).iter(|| {
+                    // ✅ Захватываем ссылку на scope
+                    let scope = &scope;
+                    async move {
+                        let handles: Vec<_> = (0..size)
+                            .map(|i| scope.spawn(async move { black_box(i) }))
+                            .collect();
+                        
+                        for handle in handles {
+                            black_box(handle.await.unwrap());
+                        }
+                    }
+                });
+            },
+        );
         
-        // Сравнение с tokio::spawn
-        group.bench_with_input(BenchmarkId::new("tokio_spawn", size), size, |b, &size| {
-            let rt = create_runtime();
-            b.to_async(&rt).iter(|| async move {
-                let handles: Vec<_> = (0..size)
-                    .map(|i| tokio::spawn(async move { i }))
-                    .collect();
+        // fast_mode
+        group.bench_with_input(
+            BenchmarkId::new("fast_mode", size),
+            &size,
+            |b, &size| {
+                let rt = tokio::runtime::Runtime::new().unwrap();
                 
-                for handle in handles {
-                    let _ = handle.await;
-                }
-            });
-        });
+                let pool = rt.block_on(async {
+                    ThreadPoolInner::with_config(PoolConfig::io_bound())
+                });
+                
+                let scope = Scope::new(pool);
+                
+                b.to_async(&rt).iter(|| {
+                    let scope = &scope;
+                    async move {
+                        let handles: Vec<_> = (0..size)
+                            .map(|i| scope.spawn(async move { black_box(i) }))
+                            .collect();
+                        
+                        for handle in handles {
+                            black_box(handle.await.unwrap());
+                        }
+                    }
+                });
+            },
+        );
+        
+        // par_map
+        group.bench_with_input(
+            BenchmarkId::new("par_map", size),
+            &size,
+            |b, &size| {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let data: Vec<_> = (0..size).collect();
+                
+                let pool = rt.block_on(async {
+                    ThreadPoolInner::with_config(PoolConfig::io_bound_fast())
+                });
+                
+                let scope = Scope::new(pool);
+                
+                b.to_async(&rt).iter(|| {
+                    let scope = &scope;
+                    let data = &data;
+                    async move {
+                        let results = scope.par_map_async(data, |&i| async move {
+                            black_box(i)
+                        }).await;
+                        black_box(results);
+                    }
+                });
+            },
+        );
+        
+        // tokio baseline
+        group.bench_with_input(
+            BenchmarkId::new("tokio_spawn", size),
+            &size,
+            |b, &size| {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                
+                b.to_async(&rt).iter(|| async {
+                    let handles: Vec<_> = (0..size)
+                        .map(|i| tokio::spawn(async move { black_box(i) }))
+                        .collect();
+                    
+                    for handle in handles {
+                        black_box(handle.await.unwrap());
+                    }
+                });
+            },
+        );
     }
     
     group.finish();
@@ -141,6 +214,7 @@ fn bench_work_stealing(c: &mut Criterion) {
                 max_pending: Some(5000),
                 enable_work_stealing: true,
                 task_timeout: Some(Duration::from_secs(30)),
+                ..Default::default()
 
             });
             let scope = Scope::new(pool.clone());

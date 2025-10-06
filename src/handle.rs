@@ -38,15 +38,18 @@ impl<T> JoinHandle<T> {
             receiver 
         }
     }
- 
+    
+    #[inline]
     pub fn cancel(&self) {
         self.cancel_token.cancel();
     }
 
+    #[inline]
     pub fn is_cancelled(&self) -> bool {
         self.cancel_token.is_cancelled()
     }
 
+    #[inline(always)]
     pub async fn await_result(self) -> Result<SpawnResult<T>, Cancelled> {
         self.receiver.await.map_err(|_| Cancelled)
     }

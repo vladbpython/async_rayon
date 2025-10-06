@@ -18,14 +18,20 @@ use std::{
         Arc,
     }, 
 };
-use crossbeam::deque::{Injector, Stealer, Worker};
+use crossbeam::{
+    deque::{Injector, Stealer, Worker},
+    queue::ArrayQueue,
+};
 use tokio::{
     sync::{oneshot, Notify, Semaphore},
     time::Duration,
 };
 use futures::{
     FutureExt,
-    stream::{FuturesUnordered, StreamExt}
+    stream::{
+        FuturesUnordered, 
+        StreamExt
+    }
 };
 use tokio_util::sync::CancellationToken;
 
@@ -37,6 +43,7 @@ pub struct Config {
     pub max_pending: Option<usize>,
     pub enable_work_stealing: bool,
     pub task_timeout: Option<Duration>,
+    pub enable_metrics: bool,
 }
 
 impl Default for Config {
@@ -47,6 +54,7 @@ impl Default for Config {
             max_pending: Some(num_cpus * 20),
             enable_work_stealing: true,
             task_timeout: Some(Duration::from_secs(30)),
+            enable_metrics: true,
         }
     }
 }
@@ -59,6 +67,7 @@ impl Config {
             max_pending: Some(num_cpus * 10),
             enable_work_stealing: true,
             task_timeout: Some(Duration::from_secs(60)),
+            enable_metrics: true,
         }
     }
 
@@ -69,6 +78,18 @@ impl Config {
             max_pending: None,
             enable_work_stealing: true,
             task_timeout: Some(Duration::from_secs(30)),
+            enable_metrics: true
+        }
+    }
+
+    pub fn io_bound_fast() -> Self{
+        let num_cpus = num_cpus::get();
+        Self {
+            num_threads: num_cpus * 2,
+            max_pending: None,
+            enable_work_stealing: true,
+            task_timeout: Some(Duration::from_secs(30)),
+            enable_metrics: false
         }
     }
 }
@@ -87,17 +108,23 @@ fn unlikely(b: bool) -> bool {
 // Основной пул потоков с оптимизациями для высоких нагрузок
 /// Основной пул потоков с оптимизациями для высоких нагрузок
 pub struct ThreadPoolInner {
-    inject: Arc<Injector<Task>>,
+   // Очереди для CPU-bound работы (spawn_blocking)
+    global_queue: Arc<ArrayQueue<Task>>,
+    local_queues: Vec<Arc<Injector<Task>>>,
+    stealers: Vec<Stealer<Task>>,
+    
+    next_worker: AtomicUsize,
+    
     global_notify: Arc<Notify>,
     cancellation_token: CancellationToken,
+    
+    // Счетчики для мониторинга
     active_spawned_tasks: Arc<AtomicUsize>,
     total_spawned: Arc<AtomicUsize>,
     completed_tasks: Arc<AtomicUsize>,
     failed_tasks: Arc<AtomicUsize>,
     all_spawned_tasks_completed: Arc<Notify>,
-    semaphore: Option<Arc<Semaphore>>,
     idle_workers: Arc<AtomicUsize>,
-    stealers: Vec<Stealer<Task>>,
     queued_tasks: Arc<AtomicUsize>,
     config: Config,
 }
@@ -112,18 +139,36 @@ impl ThreadPoolInner {
         Self::with_config(config)
     }
 
+    pub fn ref_config(&self) -> &Config {
+        &self.config
+    }
+
     #[inline(always)]
-    fn push_task(&self, task: Task) {
-        self.queued_tasks.fetch_add(1, Ordering::Relaxed);
-        self.inject.push(task);
-        
-        if unlikely(self.idle_workers.load(Ordering::Relaxed) > 0) {
-            self.global_notify.notify_one();
+    fn push_task(&self, task: Task) -> Result<(), Task> {
+        match self.global_queue.push(task) {
+            Ok(()) => {
+                self.queued_tasks.fetch_add(1, Ordering::Relaxed);
+                if unlikely(self.idle_workers.load(Ordering::Relaxed) > 0) {
+                    self.global_notify.notify_one();
+                }
+                Ok(())
+            }
+            Err(task) => {
+                let worker_id = self.next_worker.fetch_add(1, Ordering::Relaxed) 
+                    % self.local_queues.len();
+                self.local_queues[worker_id].push(task);
+                
+                if unlikely(self.idle_workers.load(Ordering::Relaxed) > 0) {
+                    self.global_notify.notify_one();
+                }
+                Ok(())
+            }
         }
     }
 
     pub fn with_config(config: Config) -> ThreadPool {
-        let inject = Arc::new(Injector::new());
+        let capacity = config.max_pending.unwrap_or(10_000);
+        let global_queue = Arc::new(ArrayQueue::new(capacity));
         let global_notify = Arc::new(Notify::new());
         let cancellation_token = CancellationToken::new();
         let active_spawned_tasks = Arc::new(AtomicUsize::new(0));
@@ -133,19 +178,26 @@ impl ThreadPoolInner {
         let all_spawned_tasks_completed = Arc::new(Notify::new());
         let idle_workers = Arc::new(AtomicUsize::new(0));
         let queued_tasks = Arc::new(AtomicUsize::new(0));
-        let semaphore = config.max_pending.map(|mp| Arc::new(Semaphore::new(mp)));
+        let next_worker = AtomicUsize::new(0);
 
-        let mut workers = Vec::new();
-        let mut stealers = Vec::new();
+        let mut local_queues = Vec::with_capacity(config.num_threads);
+        let mut workers = Vec::with_capacity(config.num_threads);
+        let mut stealers = Vec::with_capacity(config.num_threads);
         
         for _ in 0..config.num_threads {
-            let w = Worker::new_fifo();
-            stealers.push(w.stealer());
-            workers.push(w);
+            let injector = Arc::new(Injector::new());
+            let worker = Worker::new_fifo();
+            
+            stealers.push(worker.stealer());
+            local_queues.push(injector);
+            workers.push(worker);
         }
 
         let pool = Arc::new(ThreadPoolInner {
-            inject: inject.clone(),
+            global_queue,
+            local_queues,
+            stealers,
+            next_worker,
             global_notify: global_notify.clone(),
             cancellation_token: cancellation_token.clone(),
             active_spawned_tasks: active_spawned_tasks.clone(),
@@ -153,38 +205,41 @@ impl ThreadPoolInner {
             completed_tasks: completed_tasks.clone(),
             failed_tasks: failed_tasks.clone(),
             all_spawned_tasks_completed: all_spawned_tasks_completed.clone(),
-            semaphore,
             idle_workers: idle_workers.clone(),
-            stealers: stealers.clone(),
             queued_tasks: queued_tasks.clone(),
             config,
         });
 
-        // Запускаем воркеры
-        for worker in workers {
+        let mut worker_handles = Vec::new();
+        // Воркеры для CPU bound задач
+        for (worker_id, worker) in workers.into_iter().enumerate() {
             let pool_clone = pool.clone();
-            tokio::spawn(async move {
-                pool_clone.worker_loop(worker).await;
+            let handle = tokio::spawn(async move {
+                pool_clone.worker_loop(worker_id, worker).await;
             });
+            worker_handles.push(handle);
         }
 
         pool
     }
 
-    async fn worker_loop(&self, local: Worker<Task>) {
+    
+    async fn worker_loop(&self, worker_id: usize, local: Worker<Task>) {
         let enable_stealing = self.config.enable_work_stealing;
-        let num_stealers = self.stealers.len();
+        let num_workers = self.local_queues.len();
+        let my_injector = &self.local_queues[worker_id];
         
         let mut fast_random_state = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64;
         
-        const BATCH_SIZE: usize = 16;
+        let batch_size: usize = 16;
         let mut completed_batch = 0;
+        let mut steal_attempts = 0;
         
         'outer: loop {
-            if completed_batch >= BATCH_SIZE {
+            if completed_batch >= batch_size {
                 if self.cancellation_token.is_cancelled() {
                     break;
                 }
@@ -192,35 +247,44 @@ impl ThreadPoolInner {
             }
             
             let task_opt = local.pop()
+                .or_else(|| my_injector.steal().success())
+                .or_else(|| self.global_queue.pop())
                 .or_else(|| {
-                    self.inject.steal().success().map(|t| {
-                        self.queued_tasks.fetch_sub(1, Ordering::Relaxed);
-                        t
-                    })
-                })
-                .or_else(|| {
-                    if !enable_stealing || num_stealers == 0 {
+                    if !enable_stealing || num_workers <= 1 {
                         return None;
                     }
                     
-                    let total_queued = self.queued_tasks.load(Ordering::Relaxed);
-                    let active = self.active_spawned_tasks.load(Ordering::Relaxed);
+                    let max_attempts = if steal_attempts < 5 {
+                        2
+                    } else if steal_attempts < 20 {
+                        1
+                    } else {
+                        0
+                    };
                     
-                    if total_queued == 0 && active < 2 {
-                        return None;
+                    for _ in 0..max_attempts {
+                        fast_random_state ^= fast_random_state << 13;
+                        fast_random_state ^= fast_random_state >> 7;
+                        fast_random_state ^= fast_random_state << 17;
+                        
+                        let target_id = (fast_random_state as usize) % num_workers;
+                        
+                        if target_id != worker_id {
+                            if let Some(task) = self.stealers[target_id].steal().success() {
+                                steal_attempts = 0;
+                                return Some(task);
+                            }
+                        }
                     }
                     
-                    fast_random_state ^= fast_random_state << 13;
-                    fast_random_state ^= fast_random_state >> 7;
-                    fast_random_state ^= fast_random_state << 17;
-                    let idx = (fast_random_state as usize) % num_stealers;
-                    
-                    self.stealers[idx].steal().success()
+                    steal_attempts += 1;
+                    None
                 });
 
             if let Some(task) = task_opt {
                 task.await;
                 completed_batch += 1;
+                steal_attempts = 0;
                 
                 let prev = self.active_spawned_tasks.fetch_sub(1, Ordering::Release);
                 if unlikely(prev == 1) {
@@ -231,17 +295,19 @@ impl ThreadPoolInner {
             } else {
                 self.idle_workers.fetch_add(1, Ordering::Release);
                 
-                for _ in 0..2 {
-                    if !local.is_empty() || !self.inject.is_empty() {
-                        self.idle_workers.fetch_sub(1, Ordering::Acquire);
-                        continue 'outer;
-                    }
-                    std::hint::spin_loop();
+                if !local.is_empty() 
+                    || !my_injector.is_empty() 
+                    || !self.global_queue.is_empty() 
+                {
+                    self.idle_workers.fetch_sub(1, Ordering::Acquire);
+                    steal_attempts = 0;
+                    continue 'outer;
                 }
                 
                 tokio::select! {
                     _ = self.global_notify.notified() => {
                         self.idle_workers.fetch_sub(1, Ordering::Acquire);
+                        steal_attempts = 0;
                     }
                     _ = self.cancellation_token.cancelled() => {
                         self.idle_workers.fetch_sub(1, Ordering::Acquire);
@@ -266,7 +332,7 @@ impl ThreadPoolInner {
         }
     }
 
-
+    #[inline]
     pub async fn join_all(&self) {
         while self.active_spawned_tasks.load(Ordering::SeqCst) > 0 {
             self.all_spawned_tasks_completed.notified().await;
@@ -360,6 +426,7 @@ impl Scope {
         }
     }
 
+    #[inline]
     pub fn spawn<T, F>(&self, fut: F) -> JoinHandle<T>
     where
         T: Send + 'static,
@@ -374,49 +441,33 @@ impl Scope {
         T: Send + 'static,
         Fut: Future<Output = T> + Send + 'static,
     {
-        let (tx, rx) = oneshot::channel::<SpawnResult<T>>();
+        let (tx, rx) = oneshot::channel();
         let cancel_token = CancellationToken::new();
         let cancel_clone = cancel_token.clone();
 
-        // Один fetch_add вместо трех
         self.counter.fetch_add(1, Ordering::Relaxed);
-        self.pool.active_spawned_tasks.fetch_add(1, Ordering::Relaxed);
-        self.pool.total_spawned.fetch_add(1, Ordering::Relaxed);
         
         let counter = self.counter.clone();
         let notify = self.notify.clone();
         let completed = self.completed.clone();
         let failed = self.failed.clone();
-        let pool_completed = self.pool.completed_tasks.clone();
-        let pool_failed = self.pool.failed_tasks.clone();
+        let enable_metrics = self.pool.config.enable_metrics;
 
-        let task_fut = async move {
+        // Прямой tokio::spawn для async I/O
+        tokio::spawn(async move {
             let result: SpawnResult<T> = tokio::select! {
                 _ = cancel_clone.cancelled() => Err(SpawnError::Cancelled),
-                res = tokio::spawn(async move {
-                    std::panic::AssertUnwindSafe(fut)
-                        .catch_unwind()
-                        .await
-                        .map_err(|panic_info| {
-                            SpawnError::Panic(format!("{:?}", panic_info))
-                        })
-                }) => {
-                    res.unwrap_or_else(|join_err| {
-                        if join_err.is_panic() {
-                            Err(SpawnError::Panic("panic in spawned task".into()))
-                        } else {
-                            Err(SpawnError::JoinFailed(join_err.to_string()))
-                        }
-                    })
+                res = std::panic::AssertUnwindSafe(fut).catch_unwind() => {
+                    res.map_err(|e| SpawnError::Panic(format!("{:?}", e)))
                 }
             };
 
-            if result.is_ok() {
-                completed.fetch_add(1, Ordering::Relaxed);
-                pool_completed.fetch_add(1, Ordering::Relaxed);
-            } else {
-                failed.fetch_add(1, Ordering::Relaxed);
-                pool_failed.fetch_add(1, Ordering::Relaxed);
+            if enable_metrics {
+                if result.is_ok() {
+                    completed.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    failed.fetch_add(1, Ordering::Relaxed);
+                }
             }
 
             let _ = tx.send(result);
@@ -424,12 +475,9 @@ impl Scope {
             if counter.fetch_sub(1, Ordering::Release) == 1 {
                 notify.notify_one();
             }
-        };
+        });
 
-        // Используем быстрый push
-        self.pool.push_task(Box::pin(task_fut));
-
-        JoinHandle::new(cancel_token,rx )
+        JoinHandle::new(cancel_token, rx)
     }
 
     pub fn spawn_blocking_with_handle<T, F>(&self, f: F) -> JoinHandle<T>
@@ -437,78 +485,90 @@ impl Scope {
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
-        let (tx, rx) = oneshot::channel::<SpawnResult<T>>();
+        let (tx, rx) = oneshot::channel();
+        let cancel_token = CancellationToken::new();
+        let cancel_clone = cancel_token.clone();
+
+        self.counter.fetch_add(1, Ordering::Relaxed);
+        self.pool.active_spawned_tasks.fetch_add(1, Ordering::Relaxed);
+        
         let counter = self.counter.clone();
         let notify = self.notify.clone();
-        let cancel_token = CancellationToken::new();
-        let ct = cancel_token.clone();
-        let permit_sema = self.pool.semaphore.clone();
         let completed = self.completed.clone();
         let failed = self.failed.clone();
         let pool_completed = self.pool.completed_tasks.clone();
         let pool_failed = self.pool.failed_tasks.clone();
-
-        self.counter.fetch_add(1, Ordering::Relaxed);
-        self.pool.active_spawned_tasks.fetch_add(1, Ordering::Relaxed);
-        self.pool.total_spawned.fetch_add(1, Ordering::Relaxed);
+        let enable_metrics = self.pool.config.enable_metrics;
+        
+        if enable_metrics {
+            self.pool.total_spawned.fetch_add(1, Ordering::Relaxed);
+        }
 
         let task: Task = Box::pin(async move {
-            let _permit = if let Some(s) = permit_sema {
-                match s.acquire_owned().await {
-                    Ok(p) => Some(p),
-                    Err(_) => {
-                        failed.fetch_add(1, Ordering::Relaxed);
-                        pool_failed.fetch_add(1, Ordering::Relaxed);
-                        let _ = tx.send(Err(SpawnError::SemaphoreClosed));
-                        if counter.fetch_sub(1, Ordering::Release) == 1 {
-                            notify.notify_one();
-                        }
-                        return;
-                    }
-                }
-            } else { None };
-
             let result: SpawnResult<T> = tokio::select! {
-                _ = ct.cancelled() => Err(SpawnError::Cancelled),
+                _ = cancel_clone.cancelled() => Err(SpawnError::Cancelled),
                 val = tokio::task::spawn_blocking(move || {
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
                 }) => {
                     match val {
                         Ok(Ok(v)) => Ok(v),
-                        Ok(Err(panic_info)) => {
-                            Err(SpawnError::Panic(format!("{:?}", panic_info)))
-                        },
-                        Err(join_err) => {
-                            Err(SpawnError::JoinFailed(join_err.to_string()))
-                        },
+                        Ok(Err(e)) => Err(SpawnError::Panic(format!("{:?}", e))),
+                        Err(e) => Err(SpawnError::JoinFailed(e.to_string())),
                     }
                 }
             };
 
-            if result.is_ok() {
-                completed.fetch_add(1, Ordering::Relaxed);
-                pool_completed.fetch_add(1, Ordering::Relaxed);
-            } else {
-                failed.fetch_add(1, Ordering::Relaxed);
-                pool_failed.fetch_add(1, Ordering::Relaxed);
+            if enable_metrics {
+                if result.is_ok() {
+                    completed.fetch_add(1, Ordering::Relaxed);
+                    pool_completed.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    failed.fetch_add(1, Ordering::Relaxed);
+                    pool_failed.fetch_add(1, Ordering::Relaxed);
+                }
             }
 
             let _ = tx.send(result);
-            drop(_permit);
             
             if counter.fetch_sub(1, Ordering::Release) == 1 {
                 notify.notify_one();
             }
         });
 
-        self.pool.push_task(task);
+        let _ = self.pool.push_task(task);
 
-        JoinHandle::new(cancel_token,rx )
+        JoinHandle::new(cancel_token, rx)
     }
 
-    /// Ультра-быстрый spawn для простых CPU-bound задач
-    #[inline]
-    pub async fn spawn_bulk_compute<T, R, F>(
+    /// Ультра-быстрый spawn для простых async задач
+    pub async fn spawn_bulk_compute<T, R, F, Fut>(
+        &self,
+        items: Vec<T>,
+        compute: F,
+    ) -> Vec<SpawnResult<R>>
+    where
+        T: Send + 'static,
+        R: Send + 'static,
+        F: Fn(T) -> Fut + Send + Sync + Clone + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+    {
+        if items.is_empty() {
+            return Vec::new();
+        }
+
+        // Используем spawn для каждой async задачи
+        let handles: Vec<_> = items.into_iter()
+            .map(|item| {
+                let compute = compute.clone();
+                self.spawn(async move { compute(item).await })
+            })
+            .collect();
+
+        self.join_handles(handles).await
+    }
+
+    /// Ультра-быстрый spawn для простых cpu bound задач
+    pub async fn spawn_bulk_compute_cpu<T, R, F>(
         &self,
         items: Vec<T>,
         compute: F,
@@ -518,63 +578,29 @@ impl Scope {
         R: Send + 'static,
         F: Fn(T) -> R + Send + Sync + Clone + 'static,
     {
-        let len = items.len();
-        if len == 0 {
+        if items.is_empty() {
             return Vec::new();
         }
 
-        // Один batch update всех счетчиков
-        self.counter.fetch_add(len, Ordering::Relaxed);
-        self.pool.active_spawned_tasks.fetch_add(len, Ordering::Relaxed);
-        self.pool.total_spawned.fetch_add(len, Ordering::Relaxed);
-
         let compute = Arc::new(compute);
-        let mut handles = Vec::with_capacity(len);
         
-        for item in items {
-            let comp = Arc::clone(&compute);
-            let (tx, rx) = oneshot::channel();
-            
-            let counter = self.counter.clone();
-            let notify = self.notify.clone();
-            let completed = self.completed.clone();
-            let pool_completed = self.pool.completed_tasks.clone();
-            
-            // Синхронное вычисление внутри async
-            let task_fut = async move {
-                // Выполняем вычисление синхронно
-                let result = comp(item);
-                completed.fetch_add(1, Ordering::Relaxed);
-                pool_completed.fetch_add(1, Ordering::Relaxed);
-                
-                let _ = tx.send(Ok(result));
-                
-                if counter.fetch_sub(1, Ordering::Release) == 1 {
-                    notify.notify_one();
-                }
-            };
-            
-            self.pool.push_task(Box::pin(task_fut));
-            handles.push(rx);
-        }
-        
-        // Собираем результаты
-        let mut results = Vec::with_capacity(len);
-        for rx in handles {
-            let result = rx.await.unwrap_or(Err(SpawnError::ChannelClosed));
-            results.push(result);
-        }
-        
-        results
+        // Используем spawn_blocking_with_handle для каждого элемента
+        let handles: Vec<_> = items.into_iter()
+            .map(|item| {
+                let comp = Arc::clone(&compute);
+                self.spawn_blocking_with_handle(move || comp(item))
+            })
+            .collect();
+
+        self.join_handles(handles).await
     }
 
 
     /// Оптимизированная пакетная обработка
-    #[inline]
     pub async fn batch_process<T, R, F, Fut>(
         &self,
         items: Vec<T>,
-        max_concurrent_batches: usize,
+        max_concurrent: usize,
         processor: F,
     ) -> Vec<SpawnResult<R>>
     where
@@ -583,79 +609,87 @@ impl Scope {
         F: Fn(T) -> Fut + Send + Sync + Clone + 'static,
         Fut: Future<Output = R> + Send + 'static,
     {
-        let total = items.len();
-        if total == 0 {
+        if items.is_empty() {
             return Vec::new();
         }
 
-        let semaphore = Arc::new(Semaphore::new(max_concurrent_batches));
+        let semaphore = Arc::new(Semaphore::new(max_concurrent));
         let processor = Arc::new(processor);
         
-        // Pre-allocate все handles
-        let mut handles = Vec::with_capacity(total);
+        let handles: Vec<_> = items.into_iter()
+            .map(|item| {
+                let sem = Arc::clone(&semaphore);
+                let proc = Arc::clone(&processor);
+                
+                self.spawn(async move {
+                    let _permit = sem.acquire().await.unwrap();
+                    proc(item).await
+                })
+            })
+            .collect();
         
-        // Batch update счетчиков один раз
-        self.counter.fetch_add(total, Ordering::Relaxed);
-        self.pool.active_spawned_tasks.fetch_add(total, Ordering::Relaxed);
-        self.pool.total_spawned.fetch_add(total, Ordering::Relaxed);
-        
-        for item in items {
-            let sem = Arc::clone(&semaphore);
-            let proc = Arc::clone(&processor);
-            
-            let (tx, rx) = oneshot::channel();
-            let cancel_token = CancellationToken::new();
-            let cancel_clone = cancel_token.clone();
-            
-            let counter = self.counter.clone();
-            let notify = self.notify.clone();
-            let completed = self.completed.clone();
-            let failed = self.failed.clone();
-            let pool_completed = self.pool.completed_tasks.clone();
-            let pool_failed = self.pool.failed_tasks.clone();
-            
-            let task_fut = async move {
-                let result: SpawnResult<R> = tokio::select! {
-                    _ = cancel_clone.cancelled() => Err(SpawnError::Cancelled),
-                    res = tokio::spawn(async move {
-                        let _permit = sem.acquire().await.unwrap();
-                        proc(item).await
-                    }) => {
-                        res.map_err(|e| {
-                            if e.is_panic() {
-                                SpawnError::Panic("panic".into())
-                            } else {
-                                SpawnError::JoinFailed(e.to_string())
-                            }
-                        })
-                    }
-                };
-                
-                if result.is_ok() {
-                    completed.fetch_add(1, Ordering::Relaxed);
-                    pool_completed.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    failed.fetch_add(1, Ordering::Relaxed);
-                    pool_failed.fetch_add(1, Ordering::Relaxed);
-                }
-                
-                let _ = tx.send(result);
-                
-                if counter.fetch_sub(1, Ordering::Release) == 1 {
-                    notify.notify_one();
-                }
-            };
-            
-            self.pool.push_task(Box::pin(task_fut));
-            handles.push(JoinHandle::new(cancel_token,rx ));
-        }
-
         self.join_handles(handles).await
     }
 
+    /// Оптимизированная пакетная обработка CPU
+    pub async fn batch_process_cpu<T, R, F>(
+        &self,
+        items: Vec<T>,
+        chunk_size: usize,
+        processor: F,
+    ) -> Vec<SpawnResult<R>>
+    where
+        T: Send + 'static,
+        R: Send + 'static,
+        F: Fn(T) -> R + Send + Sync + Clone + 'static,
+    {
+        if items.is_empty() {
+            return Vec::new();
+        }
+        
+        let processor = Arc::new(processor);
+        let mut chunk_handles = Vec::new();
+        let mut items = items;
+        
+        // Разбиваем на чанки и обрабатываем
+        while !items.is_empty() {
+            let take = chunk_size.min(items.len());
+            let chunk: Vec<T> = items.drain(..take).collect();
+            let proc = Arc::clone(&processor);
+            
+            // Используем spawn_blocking_with_handle
+            let handle = self.spawn_blocking_with_handle(move || {
+                chunk.into_iter()
+                    .map(|item| proc(item))
+                    .collect::<Vec<R>>()
+            });
+            
+            chunk_handles.push(handle);
+        }
+        
+        // Flatten результаты
+        let mut all_results = Vec::with_capacity(items.len());
+        
+        for handle in chunk_handles {
+            match handle.await {
+                Ok(chunk_results) => {
+                    for result in chunk_results {
+                        all_results.push(Ok(result));
+                    }
+                }
+                Err(e) => {
+                    for _ in 0..chunk_size {
+                        all_results.push(Err(e.clone()));
+                    }
+                }
+            }
+        }
+        
+        all_results
+    }
+
     /// Оптимизированная потоковая обработка
-    #[inline]
-    pub async fn stream_process<T, R, F, Fut>(
+        pub async fn stream_process<T, R, F, Fut>(
         &self,
         items: Vec<T>,
         max_concurrent: usize,
@@ -680,13 +714,12 @@ impl Scope {
         let mut results = Vec::with_capacity(items.len());
         let mut items_iter = items.into_iter();
         
-        // Заполняем начальную партию
         for _ in 0..max_concurrent {
             if let Some(item) = items_iter.next() {
                 let proc = Arc::clone(&processor);
                 let sem = Arc::clone(&semaphore);
                 
-                let fut = self.spawn_with_handle(async move {
+                let fut = self.spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
                     proc(item).await
                 });
@@ -697,7 +730,6 @@ impl Scope {
             }
         }
         
-        // Streaming processing
         while let Some(result) = futures.next().await {
             results.push(result);
             
@@ -705,7 +737,7 @@ impl Scope {
                 let proc = Arc::clone(&processor);
                 let sem = Arc::clone(&semaphore);
                 
-                let fut = self.spawn_with_handle(async move {
+                let fut = self.spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
                     proc(item).await
                 });
@@ -715,6 +747,97 @@ impl Scope {
         }
         
         results
+    }
+
+    /// Оптимизированный параллельный map
+    pub async fn par_map_async<T, U, F, Fut>(
+        &self,
+        items: &[T],
+        f: F,
+    ) -> Vec<SpawnResult<U>>
+    where
+        T: Sync,
+        U: Send + 'static,
+        F: Fn(&T) -> Fut + Sync + Send + 'static,
+        Fut: Future<Output = U> + Send + 'static,
+    {
+        if items.is_empty() {
+            return Vec::new();
+        }
+        
+        // Создаем все задачи через spawn
+        let handles: Vec<_> = items.iter()
+            .map(|item| self.spawn(f(item)))
+            .collect();
+        
+        // Ждем результаты
+        self.join_handles(handles).await
+    }
+
+    async fn collect_chunk_results<U>(
+        &self,
+        chunk_handles: Vec<JoinHandle<Vec<U>>>,
+        chunk_size: usize,
+        total: usize,
+    ) -> Vec<SpawnResult<U>>
+    where
+        U: Send + 'static,
+    {
+        let mut all_results = Vec::with_capacity(total);
+        
+        for handle in chunk_handles {
+            match handle.await {
+                Ok(chunk_results) => {
+                    for result in chunk_results {
+                        all_results.push(Ok(result));
+                    }
+                }
+                Err(e) => {
+                    for _ in 0..chunk_size.min(total - all_results.len()) {
+                        all_results.push(Err(e.clone()));
+                    }
+                }
+            }
+        }
+        
+        all_results
+    }
+
+    /// Оптимизированный параллельный map cpu bound
+        pub async fn par_map_cpu<T, U, F>(
+        &self,
+        mut items: Vec<T>,
+        chunk_size: usize,
+        f: F,
+    ) -> Vec<SpawnResult<U>>
+    where
+        T: Send + 'static,
+        U: Send + 'static,
+        F: Fn(T) -> U + Sync + Send + 'static,
+    {
+        if items.is_empty() {
+            return Vec::new();
+        }
+        
+        let total = items.len();
+        let f = Arc::new(f);
+        let mut chunk_handles = Vec::new();
+        
+        while !items.is_empty() {
+            let take = chunk_size.min(items.len());
+            let chunk: Vec<T> = items.drain(..take).collect();
+            let func = Arc::clone(&f);
+            
+            let handle = self.spawn_blocking_with_handle(move || {
+                chunk.into_iter()
+                    .map(|item| func(item))
+                    .collect::<Vec<U>>()
+            });
+            
+            chunk_handles.push(handle);
+        }
+        
+        self.collect_chunk_results(chunk_handles, chunk_size, total).await
     }
 
     pub async fn wait(&self) {
@@ -733,6 +856,7 @@ impl Scope {
         true
     }
 
+    #[inline]
     pub fn cancel_all<T>(&self, handles: &[JoinHandle<T>]) {
         for h in handles {
             h.cancel();
@@ -756,80 +880,10 @@ impl Scope {
         while let Some(result) = futures.next().await {
             results.push(result);
         }
-
         results
+    
     }
 
-    /// Оптимизированный параллельный map
-    #[inline]
-    pub async fn par_map_async<T, U, F, Fut>(&self, items: &[T], f: F) -> Vec<SpawnResult<U>>
-    where
-        T: Sync,
-        U: Send + 'static,
-        F: Fn(&T) -> Fut + Sync + Send + 'static,
-        Fut: Future<Output = U> + Send + 'static,
-    {
-        if items.is_empty() {
-            return Vec::new();
-        }
-
-        let len = items.len();
-        
-        // Batch update счетчиков
-        self.counter.fetch_add(len, Ordering::Relaxed);
-        self.pool.active_spawned_tasks.fetch_add(len, Ordering::Relaxed);
-        self.pool.total_spawned.fetch_add(len, Ordering::Relaxed);
-        
-        let handles: Vec<_> = items.iter()
-            .map(|item| {
-                let (tx, rx) = oneshot::channel();
-                let cancel_token = CancellationToken::new();
-                let cancel_clone = cancel_token.clone();
-                
-                let fut = f(item);
-                let counter = self.counter.clone();
-                let notify = self.notify.clone();
-                let completed = self.completed.clone();
-                let failed = self.failed.clone();
-                let pool_completed = self.pool.completed_tasks.clone();
-                let pool_failed = self.pool.failed_tasks.clone();
-                
-                let task_fut = async move {
-                    let result: SpawnResult<U> = tokio::select! {
-                        _ = cancel_clone.cancelled() => Err(SpawnError::Cancelled),
-                        res = tokio::spawn(fut) => {
-                            res.map_err(|e| {
-                                if e.is_panic() {
-                                    SpawnError::Panic("panic".into())
-                                } else {
-                                    SpawnError::JoinFailed(e.to_string())
-                                }
-                            })
-                        }
-                    };
-                    
-                    if result.is_ok() {
-                        completed.fetch_add(1, Ordering::Relaxed);
-                        pool_completed.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        failed.fetch_add(1, Ordering::Relaxed);
-                        pool_failed.fetch_add(1, Ordering::Relaxed);
-                    }
-                    
-                    let _ = tx.send(result);
-                    
-                    if counter.fetch_sub(1, Ordering::Release) == 1 {
-                        notify.notify_one();
-                    }
-                };
-                
-                self.pool.push_task(Box::pin(task_fut));
-                JoinHandle::new(cancel_token, rx)
-            })
-            .collect();
-
-        self.join_handles(handles).await
-    }
 
     #[inline]
     pub fn metrics(&self) -> ScopeMetrics {
