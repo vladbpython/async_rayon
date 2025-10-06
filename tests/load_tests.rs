@@ -2,6 +2,7 @@
 mod tests {
     use async_rayon::{
     errors::SpawnError,
+    model::JoinOrdering,
     pool::{
         Config,
         ThreadPoolInner,
@@ -37,7 +38,7 @@ mod tests {
             scope.batch_process(items,  100, |x| Box::pin(async move {
                 tokio::time::sleep(Duration::from_micros(100)).await;
                 x * 2
-            })).await
+            }),JoinOrdering::UnOrdered).await
         }).await;
 
         assert_eq!(results.len(), 10_000);
@@ -58,7 +59,7 @@ mod tests {
             scope.batch_process(items, 50, |x| Box::pin(async move {
                 tokio::time::sleep(Duration::from_millis(5)).await;
                 format!("result_{}", x)
-            })).await
+            }),JoinOrdering::UnOrdered).await
         }).await;
 
         let successful = results.iter().filter(|r| r.is_ok()).count();
@@ -85,7 +86,7 @@ mod tests {
                 .collect()
         }).await;
 
-        let results = scope.join_handles(handles).await;
+        let results = scope.join_handles(handles,JoinOrdering::UnOrdered).await;
         let successful = results.iter().filter(|r| r.is_ok()).count();
         println!("  Успешно: {}/{}", successful, results.len());
     }
@@ -102,7 +103,7 @@ mod tests {
                 scope.batch_process(items, 100, |x| Box::pin(async move {
                     tokio::time::sleep(Duration::from_micros(500)).await;
                     x + 1
-                })).await
+                }),JoinOrdering::UnOrdered).await
             }),
             
             measure("500 blocking tasks", || async {
@@ -112,7 +113,7 @@ mod tests {
                         i * 2
                     }))
                     .collect();
-                scope.join_handles(handles).await
+                scope.join_handles(handles,JoinOrdering::UnOrdered).await
             }),
             
             measure("1k stream tasks", || async {
@@ -141,7 +142,7 @@ mod tests {
         let results = scope.batch_process(items, 500, |x| Box::pin(async move {
             tokio::time::sleep(Duration::from_micros(50)).await;
             x % 1000
-        })).await;
+        }),JoinOrdering::UnOrdered).await;
         let elapsed = start.elapsed();
 
         let successful = results.iter().filter(|r| r.is_ok()).count();
@@ -174,7 +175,7 @@ mod tests {
                 }
                 tokio::time::sleep(Duration::from_micros(100)).await;
                 x
-            })).await
+            }),JoinOrdering::UnOrdered).await
         }).await;
 
         let successful = results.iter().filter(|r| r.is_ok()).count();
@@ -205,7 +206,7 @@ mod tests {
                     scope.batch_process(items, 100, |x| Box::pin(async move {
                         tokio::time::sleep(Duration::from_micros(200)).await;
                         x
-                    })).await
+                    }),JoinOrdering::UnOrdered).await
                 }),
                 
                 pool.scope_async(|scope| async move {
@@ -213,7 +214,7 @@ mod tests {
                     scope.batch_process(items, 100, |x| Box::pin(async move {
                         tokio::time::sleep(Duration::from_micros(200)).await;
                         x * 2
-                    })).await
+                    }),JoinOrdering::UnOrdered).await
                 }),
                 
                 pool.scope_async(|scope| async move {
@@ -221,7 +222,7 @@ mod tests {
                     scope.batch_process(items, 100, |x| Box::pin(async move {
                         tokio::time::sleep(Duration::from_micros(200)).await;
                         x * 3
-                    })).await
+                    }),JoinOrdering::UnOrdered).await
                 })
             );
             
@@ -252,7 +253,7 @@ mod tests {
             scope.batch_process(items, 200, |x| Box::pin(async move {
                 tokio::time::sleep(Duration::from_micros(50)).await;
                 x
-            })).await
+            }),JoinOrdering::UnOrdered).await
         }).await;
 
         println!("  Stream успешно: {}/20000", stream_results.iter().filter(|r| r.is_ok()).count());

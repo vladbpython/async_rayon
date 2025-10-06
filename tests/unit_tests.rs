@@ -2,6 +2,7 @@
 mod tests {
     use async_rayon::{
     errors::SpawnError,
+    model::JoinOrdering,
     pool::{
         Config,
         ThreadPoolInner,
@@ -199,7 +200,7 @@ mod tests {
                 panic!("Test panic");
             }
             x
-        })).await;
+        }),JoinOrdering::Ordered).await;
 
         // Даем время метрикам обновиться
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -217,9 +218,9 @@ mod tests {
         println!("    Завершено: {}", scope_metrics.completed);
         println!("    Провалено: {}", scope_metrics.failed);
         
-        assert!(pool_metrics.total_spawned >= 1000, "Должно быть запущено минимум 1000 задач");
-        assert!(pool_metrics.completed_tasks > 0, "Должны быть завершенные задачи");
-        assert!(pool_metrics.failed_tasks > 0, "Должны быть проваленные задачи (из-за паник)");
+        assert!(scope_metrics.total() >= 1000, "Должно быть запущено минимум 1000 задач");
+        assert!(scope_metrics.completed > 0, "Должны быть завершенные задачи");
+        assert!(scope_metrics.failed > 0, "Должны быть проваленные задачи (из-за паник)");
         
         // Восстанавливаем panic handler
         drop(_guard);
@@ -243,7 +244,7 @@ mod tests {
         let _results = scope.batch_process(items, 20,  |x| Box::pin(async move {
             tokio::time::sleep(Duration::from_millis(10)).await;
             x
-        })).await;
+        }),JoinOrdering::Ordered).await;
 
         monitor_token.cancel();
         println!("  ✓ Мониторинг завершен");

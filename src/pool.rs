@@ -8,6 +8,7 @@ use super::{
     model::{
         PoolMetrics,
         ScopeMetrics,
+        JoinOrdering,
     },
 };
 use std::{
@@ -29,6 +30,7 @@ use tokio::{
 use futures::{
     FutureExt,
     stream::{
+        FuturesOrdered,
         FuturesUnordered, 
         StreamExt
     }
@@ -545,6 +547,7 @@ impl Scope {
         &self,
         items: Vec<T>,
         compute: F,
+        ordering: JoinOrdering,
     ) -> Vec<SpawnResult<R>>
     where
         T: Send + 'static,
@@ -564,7 +567,7 @@ impl Scope {
             })
             .collect();
 
-        self.join_handles(handles).await
+        self.join_handles(handles,ordering).await
     }
 
     /// Ультра-быстрый spawn для простых cpu bound задач
@@ -572,6 +575,7 @@ impl Scope {
         &self,
         items: Vec<T>,
         compute: F,
+        ordering: JoinOrdering,
     ) -> Vec<SpawnResult<R>>
     where
         T: Send + 'static,
@@ -592,7 +596,7 @@ impl Scope {
             })
             .collect();
 
-        self.join_handles(handles).await
+        self.join_handles(handles,ordering).await
     }
 
 
@@ -602,6 +606,7 @@ impl Scope {
         items: Vec<T>,
         max_concurrent: usize,
         processor: F,
+        ordering: JoinOrdering,
     ) -> Vec<SpawnResult<R>>
     where
         T: Send + 'static,
@@ -628,7 +633,7 @@ impl Scope {
             })
             .collect();
         
-        self.join_handles(handles).await
+        self.join_handles(handles,ordering).await
     }
 
     /// Оптимизированная пакетная обработка CPU
@@ -754,6 +759,7 @@ impl Scope {
         &self,
         items: &[T],
         f: F,
+        ordering: JoinOrdering,
     ) -> Vec<SpawnResult<U>>
     where
         T: Sync,
@@ -771,7 +777,7 @@ impl Scope {
             .collect();
         
         // Ждем результаты
-        self.join_handles(handles).await
+        self.join_handles(handles,ordering).await
     }
 
     async fn collect_chunk_results<U>(
@@ -863,16 +869,24 @@ impl Scope {
         }
     }
 
-    /// Оптимизированное ожидание handles
-    #[inline]
-    pub async fn join_handles<T>(&self, handles: Vec<JoinHandle<T>>) -> Vec<SpawnResult<T>>
-    where
-        T: Send + 'static,
-    {
-        if handles.is_empty() {
-            return Vec::new();
+    async fn join_handles_ordered<T>(
+        &self, 
+        handles: Vec<JoinHandle<T>>,
+    ) ->  Vec<SpawnResult<T>>{
+        let len = handles.len();
+        let mut futures = FuturesOrdered::from_iter(handles);
+        let mut results = Vec::with_capacity(len);
+        
+        while let Some(result) = futures.next().await {
+            results.push(result);
         }
+        results
+    }
 
+    async fn join_handles_unordered<T>(
+        &self, 
+        handles: Vec<JoinHandle<T>>,
+    ) ->  Vec<SpawnResult<T>>{
         let len = handles.len();
         let mut futures = FuturesUnordered::from_iter(handles);
         let mut results = Vec::with_capacity(len);
@@ -881,6 +895,27 @@ impl Scope {
             results.push(result);
         }
         results
+    }
+
+    /// Оптимизированное ожидание handles
+    #[inline]
+    pub async fn join_handles<T>(
+        &self, 
+        handles: Vec<JoinHandle<T>>,
+        ordering: JoinOrdering,
+    ) -> Vec<SpawnResult<T>>
+    where
+        T: Send + 'static,
+    {
+        if handles.is_empty() {
+            return Vec::new();
+        }
+
+        match ordering {
+            JoinOrdering::Ordered => self.join_handles_ordered(handles).await,
+            JoinOrdering::UnOrdered => self.join_handles_unordered(handles).await
+            
+        }
     
     }
 

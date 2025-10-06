@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
-use async_rayon::pool::{ThreadPoolInner, Config as PoolConfig, Scope};
+use async_rayon::{model::JoinOrdering, pool::{Config as PoolConfig, Scope, ThreadPoolInner}};
 use tokio::time::Duration;
 use std::hint::black_box;
 
@@ -96,7 +96,7 @@ fn bench_spawn_overhead(c: &mut Criterion) {
                     async move {
                         let results = scope.par_map_async(data, |&i| async move {
                             black_box(i)
-                        }).await;
+                        },JoinOrdering::Ordered).await;
                         black_box(results);
                     }
                 });
@@ -148,7 +148,8 @@ fn bench_batch_processing(c: &mut Criterion) {
                     let _results = scope.batch_process(
                         items,
                         batch_size,
-                        |x| Box::pin(async move { black_box(x * 2) })
+                        |x| Box::pin(async move { black_box(x * 2) }),
+                        JoinOrdering::UnOrdered
                     ).await;
                 });
             }
@@ -193,7 +194,8 @@ fn bench_stream_vs_batch(c: &mut Criterion) {
             let _results = scope.batch_process(
                 items,
                 500,
-                |x| Box::pin(async move { black_box(x * 2) })
+                |x| Box::pin(async move { black_box(x * 2) }),
+                JoinOrdering::UnOrdered
             ).await;
         });
     });
@@ -229,7 +231,8 @@ fn bench_work_stealing(c: &mut Criterion) {
                         tokio::time::sleep(Duration::from_micros(10)).await;
                     }
                     black_box(x)
-                })
+                }),
+                JoinOrdering::UnOrdered
             ).await;
         });
     });
@@ -256,7 +259,8 @@ fn bench_work_stealing(c: &mut Criterion) {
                         tokio::time::sleep(Duration::from_micros(10)).await;
                     }
                     black_box(x)
-                })
+                }),
+                JoinOrdering::UnOrdered
             ).await;
         });
     });
@@ -296,7 +300,8 @@ fn bench_thread_scaling(c: &mut Criterion) {
                             |x| Box::pin(async move {
                                 tokio::task::yield_now().await;
                                 black_box(x * 2)
-                            })
+                            }),
+                            JoinOrdering::UnOrdered
                         ).await;
                     });
                 }
@@ -325,7 +330,8 @@ fn bench_config_comparison(c: &mut Criterion) {
             let _results = scope.batch_process(
                 items,
                 250,
-                |x| Box::pin(async move { black_box(x * x * x) })
+                |x| Box::pin(async move { black_box(x * x * x) }),
+                JoinOrdering::UnOrdered
             ).await;
         });
     });
@@ -344,7 +350,8 @@ fn bench_config_comparison(c: &mut Criterion) {
                 |x| Box::pin(async move {
                     tokio::task::yield_now().await;
                     black_box(x * 2)
-                })
+                }),
+                JoinOrdering::UnOrdered
             ).await;
         });
     });
@@ -377,7 +384,7 @@ fn bench_blocking_tasks(c: &mut Criterion) {
                     }))
                     .collect();
                 
-                let _results = scope.join_handles(handles).await;
+                let _results = scope.join_handles(handles,JoinOrdering::UnOrdered).await;
             });
         });
     }

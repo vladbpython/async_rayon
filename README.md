@@ -75,7 +75,7 @@ let handles: Vec<_> = (0..100_000)
 
 | `Feature` | `rayon` | `async_rayon`|
 | ---| ---| ---|
-| Speed (CPU) | 50ms for 5M tasks ✅ | 4s for 5M tasks ❌ |
+| Speed (CPU) | 50ms for 5M tasks ✅ | 4.2s for 5M tasks ❌ |
 | Blocking | ✅ Sync - no async overhead| ✅ Non-blocking async |
 | I/O tasks | ❌ Blocks OS threads  | ✅ 10k+ concurrent I/O |
 | Work-stealing | ✅ OS thread level | ✅ Async task level |
@@ -113,12 +113,12 @@ let results = scope.stream_process(
 
 ## 10,000 tasks
 - `tokio::spawn`: 3.4ms  (2.96M tasks/sec) ← baseline
-- `async_rayon`:  14.0ms  (713K tasks/sec)  ← 4.1x slower
+- `async_rayon`:  9.7ms  (1.03M/s tasks/sec)  ← 4.1x slower
 - `rayon` (CPU-bound):      0.05ms (200M tasks/sec)  ← 70x faster for sync
 
 ## 5,000,000 tasks
 - `tokio::spawn`: ~3-4s
-- `async_rayon`: ~6-7s
+- `async_rayon`: ~4.2-4.4s
 - `rayon`: ~50ms (CPU-bound only)
 
 # When to Use

@@ -51,3 +51,9 @@ impl ScopeMetrics {
         self.completed as f64 / finished as f64
     }
 }
+
+
+pub enum JoinOrdering {
+    Ordered,
+    UnOrdered,    
+}
