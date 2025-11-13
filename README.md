@@ -1,6 +1,8 @@
 # async_rayon
 async rayon implementetion tokio in development
 
+# WARNING! LIBRARY IS NOT SUPPORTED!
+
 # Why This Library?
 `tokio::spawn` is fast but offers no resource control. `rayon` is excellent for CPU-bound work but blocking. This library sits in between - providing resource control with acceptable overhead (~4x slower than `tokio::spawn`).
 
